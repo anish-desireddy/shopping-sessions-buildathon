@@ -1,11 +1,12 @@
 # Generated datasets and benchmark scratch/output
-dev/
-dev5/
-out/
-out5/
-out-*/
+dev*/
+out*/
+docker-*/
 .scratch/
 .venv*/
+
+# Rust build output
+rust/**/target/
 
 # Logs and caches
 *.log

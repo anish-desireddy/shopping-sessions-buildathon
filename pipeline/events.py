@@ -269,7 +269,10 @@ def _first_field(raw: bytes) -> str:
 
 
 def _partition_events(
-    event_paths, scratch: str, stats: Optional[StageStats]
+    event_paths,
+    scratch: str,
+    stats: Optional[StageStats],
+    count: int = PARTITION_COUNT,
 ) -> List[str]:
     """Copy every raw event line into one of PARTITION_COUNT scratch files.
 
@@ -280,7 +283,7 @@ def _partition_events(
     """
     paths = [
         os.path.join(scratch, f"event-part-{index:02d}.csv")
-        for index in range(PARTITION_COUNT)
+        for index in range(count)
     ]
     handles = [open(path, "wb", buffering=1 << 20) for path in paths]
     try:
@@ -306,7 +309,7 @@ def _partition_events(
                         if stats is not None:
                             stats.csv_malformed += 1
                         continue
-                    out = handles[hash(_first_field(raw)) % PARTITION_COUNT]
+                    out = handles[hash(_first_field(raw)) % count]
                     out.write(raw)
                     out.write(b"\n")
     finally:
@@ -545,13 +548,16 @@ def _group_by_person(
     return by_person
 
 
-def run_event_stage(data_dir, log: bool = False, scratch=None) -> EventResult:
+def run_event_stage(
+    data_dir, log: bool = False, scratch=None, workers: int = 1
+) -> EventResult:
     """Run the whole event stage on a ``/data``-shaped directory.
 
     With a ``scratch`` directory, dedup is hash-partitioned through raw-line
     scratch files (bounded memory); without one it uses a single in-memory
     Python dictionary, which is what most unit tests and diagnostic scripts
-    exercise.
+    exercise.  ``workers > 1`` is the Phase 6 experiment: whole partitions are
+    deduped and validated in fork workers, then merged by person here.
     """
     data = Path(data_dir)
     started = time.perf_counter()
@@ -580,7 +586,22 @@ def run_event_stage(data_dir, log: bool = False, scratch=None) -> EventResult:
 
     event_paths = sorted((data / "events").glob("*.csv"))
     partitioned = scratch is not None
-    if partitioned:
+    if partitioned and workers > 1:
+        import events_parallel
+
+        by_person = events_parallel.dedup_events_parallel(
+            event_paths,
+            scratch,
+            window_start_ms,
+            window_end_ms,
+            products,
+            person_names,
+            stats,
+            workers=workers,
+            log=log,
+        )
+        after_dedup = precedent
+    elif partitioned:
         by_person = dedup_events_partitioned(
             event_paths,
             scratch,

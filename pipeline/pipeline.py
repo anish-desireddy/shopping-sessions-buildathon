@@ -37,6 +37,7 @@ import resource
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import duckdb
 
@@ -137,6 +138,33 @@ def _write_user_daily(con, rows, out_dir: str, scratch: str) -> None:
     )
 
 
+def _write_user_daily_csv(con, csv_path: str, out_dir: str) -> None:
+    """Write user_daily from the Rust CSV handoff, without Python row objects."""
+    out_path = os.path.join(out_dir, "user_daily", "part-0.parquet")
+    started = time.perf_counter()
+    if os.path.getsize(csv_path) == 0:
+        con.execute(
+            f"COPY ({USER_EMPTY_SELECT}) TO '{out_path}' (FORMAT parquet)"
+        )
+    else:
+        _copy_csv(con, csv_path, USER_COLUMNS, USER_SELECT, out_path)
+    _log(f"[pipeline] write user_daily {time.perf_counter() - started:.3f}s")
+
+
+def _write_campaign_daily_csv(con, csv_path: str, out_dir: str) -> None:
+    out_path = os.path.join(out_dir, "campaign_daily", "part-0.parquet")
+    started = time.perf_counter()
+    if os.path.getsize(csv_path) == 0:
+        con.execute(
+            f"COPY ({CAMPAIGN_EMPTY_SELECT}) TO '{out_path}' (FORMAT parquet)"
+        )
+    else:
+        _copy_csv(
+            con, csv_path, CAMPAIGN_COLUMNS, CAMPAIGN_SELECT, out_path
+        )
+    _log(f"[pipeline] write campaign_daily {time.perf_counter() - started:.3f}s")
+
+
 def _write_campaign_daily(con, rows, out_dir: str, scratch: str) -> None:
     out_path = os.path.join(out_dir, "campaign_daily", "part-0.parquet")
     started = time.perf_counter()
@@ -209,6 +237,7 @@ def main() -> None:
     scratch = os.environ.get("SCRATCH_DIR", "/scratch")
     ncpu = int(os.environ.get("NCPU", os.cpu_count() or 1))
     mem_gb = int(os.environ.get("MEM_GB", "8"))
+    event_workers = int(os.environ.get("EVENT_WORKERS", "1"))
 
     started = time.perf_counter()
     # Both output folders must exist even if a table ends up empty.
@@ -222,8 +251,50 @@ def main() -> None:
     # 1-7: read manifest/links/lookups, parse + dedup + validate events,
     # sessionize. Dedup is hash-partitioned, so the 60M-entry Python dict never
     # exists; only one partition's winners are resident at a time.
-    event_result = events.run_event_stage(data_dir, log=True, scratch=scratch)
+    backend = os.environ.get("PIPELINE_BACKEND", "python")
+    if backend in ("rust", "rust-all"):
+        import rust_bridge
+
+        (
+            sessions,
+            rust_rows,
+            window_start_ms,
+            window_end_ms,
+            rust_stats,
+            rust_user_csv,
+            rust_campaign_csv,
+        ) = rust_bridge.run_stage(data_dir, scratch, backend, log=True)
+        person_names = (
+            events.build_person_names(
+                sorted((Path(data_dir) / "links").glob("*.csv")), rust_stats
+            )
+            if backend == "rust"
+            else {}
+        )
+        event_result = events.EventResult(
+            sessions, person_names, window_start_ms, window_end_ms, rust_stats
+        )
+    else:
+        event_result = events.run_event_stage(
+            data_dir, log=True, scratch=scratch, workers=event_workers
+        )
+        rust_user_csv = rust_campaign_csv = None
     _log(f"[pipeline] peak after events {_peak_rss_mb():.0f}MB")
+
+    if backend == "rust-all":
+        con = _connect(scratch, ncpu, mem_gb)
+        try:
+            _write_user_daily_csv(con, rust_user_csv, out_dir)
+            _write_campaign_daily_csv(con, rust_campaign_csv, out_dir)
+        finally:
+            con.close()
+            _remove(rust_user_csv)
+            _remove(rust_campaign_csv)
+        _log(
+            f"[pipeline] total {time.perf_counter() - started:.3f}s "
+            f"peak_rss={_peak_rss_mb():.0f}MB"
+        )
+        return
 
     user_rows = user_daily.build_user_daily(event_result.sessions)
     _log(
@@ -239,12 +310,16 @@ def main() -> None:
         _write_user_daily(con, user_rows, out_dir, scratch)
         del user_rows
 
-        # 8-9: stream credit + assists into campaign counters (no list).
-        builder = campaign_daily.CampaignDailyBuilder()
-        stream = clicks.run_attribution_stream(
-            event_result, data_dir, builder.add, log=True
-        )
-        campaign_rows = builder.rows(stream.campaign_channels)
+        # 8-9: stream credit + assists into campaign counters (no list), or
+        # consume the Rust attribution rows for the hybrid backend.
+        if backend == "rust-all":
+            campaign_rows = rust_rows
+        else:
+            builder = campaign_daily.CampaignDailyBuilder()
+            stream = clicks.run_attribution_stream(
+                event_result, data_dir, builder.add, log=True
+            )
+            campaign_rows = builder.rows(stream.campaign_channels)
         _log(
             f"[pipeline] campaign_daily rows={len(campaign_rows)} "
             f"peak={_peak_rss_mb():.0f}MB"

@@ -1,5 +1,8 @@
 fixtures/
-dev/
-out/
+dev*/
+out*/
+docker-*/
+.scratch/
+rust/**/target/
 *.md
 .git
