@@ -1477,6 +1477,13 @@ fn map_file(p: &Path) -> &'static [u8] {
     }
     match unsafe { memmap2::Mmap::map(&f) } {
         Ok(m) => {
+            // The scorer's /data mount is cold for each run. Ask the kernel to start reading the
+            // whole file now; parsing then faults in pages that are already in flight instead of
+            // paying the read latency inside the parse loop.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::madvise(m.as_ptr() as *mut libc::c_void, m.len(), libc::MADV_WILLNEED);
+            }
             let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
             MAPS.lock().unwrap().push((m.as_ptr() as usize, m.len()));
             &m[..]
