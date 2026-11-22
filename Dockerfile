@@ -1,45 +1,17 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+# Shopping Sessions engine: one static Rust binary on an empty base image.
+# Pinned by digest (rustc 1.100.0) so the final rebuild uses the exact toolchain we validated.
+FROM rust:1-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# Scorers are Intel Xeon (Cascade Lake or newer): AVX2/BMI2 are safe. Static glibc so the
+# runtime image can be empty and start fast.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
+ && cp target/x86_64-unknown-linux-gnu/release/sessions /sessions
 
-# Build the Rust event/attribution binary for the same glibc as the runtime.
-FROM rust:1.85-slim-bookworm AS rust-build
-WORKDIR /build
-COPY rust/ /build/rust/
-RUN cargo build --release --manifest-path rust/shopping-pipeline/Cargo.toml
-
-FROM python:3.12-slim-bookworm
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY --from=rust-build /build/rust/shopping-pipeline/target/release/shopping-pipeline /app/bin/shopping-pipeline
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-#
-# Recommended: W8/P128. The documented fallback for a 6-vCPU host is W6/P128:
-# set RUST_WORKERS=6, SHOPPING_CLICK_WORKERS=6 and SHOPPING_SESSION_WORKERS=6,
-# and keep PARTITION_COUNT=128. This file uses the recommended W8/P128 values.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIPELINE_BACKEND=rust-all \
-    RUST_WORKERS=8 \
-    PARTITION_COUNT=128 \
-    SHOPPING_INMEMORY_PARTS=1 \
-    SHOPPING_COMPACT_EVENTS=1 \
-    SHOPPING_PARALLEL_CLICKS=1 \
-    SHOPPING_CLICK_WORKERS=8 \
-    SHOPPING_PARALLEL_SESSIONIZE=1 \
-    SHOPPING_SESSION_WORKERS=8 \
-    SHOPPING_FUSED_CLICKS=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM scratch
+COPY --from=build /sessions /sessions
+USER 1000:1000
+ENV DATA_DIR=/data OUTPUT_DIR=/output
+ENTRYPOINT ["/sessions"]
