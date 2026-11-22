@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Scorers are Intel Xeon (Cascade Lake or newer): AVX2/BMI2 are safe. Static glibc so the
 # runtime image can be empty and start fast.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+crt-static"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/sessions /sessions
 
