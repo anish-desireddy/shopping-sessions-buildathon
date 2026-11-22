@@ -14,5 +14,5 @@ FROM scratch
 COPY --from=build /sessions /sessions
 USER 1000:1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output \
-    SS_PROWS=24000
+    SS_PROWS=48000
 ENTRYPOINT ["/sessions"]
